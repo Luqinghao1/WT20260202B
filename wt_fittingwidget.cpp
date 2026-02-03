@@ -2,9 +2,9 @@
  * 文件名: wt_fittingwidget.cpp
  * 文件作用: 试井拟合分析主界面实现文件
  * 修改记录:
- * 1. 连接 m_chartSemiLog 信号。
- * 2. 实现 onSemiLogLineMoved。
- * 3. [修复] 移除对不存在的 UI 控件 lineEdit_Equation/Pi 的访问，仅更新参数表。
+ * 1. [修复] 修正 FittingDataSettings 成员缺失导致的编译错误。
+ * 2. [修复] 修正 loadFittingState 中枚举类型名称错误 (FittingTestType -> WellTestType)。
+ * 3. [优化] 加载数据时自动填充物理参数到 Settings，确保保存时数据完整。
  */
 
 #include "wt_fittingwidget.h"
@@ -48,6 +48,7 @@ FittingWidget::FittingWidget(QWidget *parent) :
 {
     ui->setupUi(this);
 
+    // 清理旧布局
     if (ui->plotContainer->layout()) {
         QLayoutItem* item;
         while ((item = ui->plotContainer->layout()->takeAt(0)) != nullptr) {
@@ -59,11 +60,13 @@ FittingWidget::FittingWidget(QWidget *parent) :
     containerLayout->setContentsMargins(0,0,0,0);
     containerLayout->setSpacing(0);
 
+    // 初始化 MDI 区域
     m_mdiArea = new QMdiArea(this);
     m_mdiArea->setViewMode(QMdiArea::SubWindowView);
     m_mdiArea->setBackground(QBrush(QColor(240, 240, 240)));
     containerLayout->addWidget(m_mdiArea);
 
+    // 创建图表窗口
     m_chartLogLog = new FittingChart1(this);
     m_chartSemiLog = new FittingChart2(this);
     m_chartCartesian = new FittingChart3(this);
@@ -88,8 +91,8 @@ FittingWidget::FittingWidget(QWidget *parent) :
     connect(m_chartSemiLog, &FittingChart2::exportDataTriggered, this, &FittingWidget::onExportCurveData);
     connect(m_chartCartesian, &FittingChart3::exportDataTriggered, this, &FittingWidget::onExportCurveData);
 
-    // 连接信号
-    connect(m_chartSemiLog, &FittingChart2::sigLineMoved, this, &FittingWidget::onSemiLogLineMoved);
+    // [修改] 连接 m_chartManager 的信号，而不是 m_chartSemiLog
+    connect(m_chartManager, &FittingChart::sigManualPressureUpdated, this, &FittingWidget::onSemiLogLineMoved);
 
     ui->splitter->setSizes(QList<int>() << 350 << 650);
     ui->splitter->setCollapsible(0, false);
@@ -124,9 +127,9 @@ FittingWidget::~FittingWidget()
     delete ui;
 }
 
-// 响应半对数直线移动
 void FittingWidget::onSemiLogLineMoved(double k, double b)
 {
+    Q_UNUSED(k);
     // 更新参数表中的 Pi (初始地层压力)
     QList<FitParameter> params = m_paramChart->getParameters();
     bool updated = false;
@@ -139,17 +142,7 @@ void FittingWidget::onSemiLogLineMoved(double k, double b)
     }
     if(updated) {
         m_paramChart->setParameters(params);
-        // 如果需要，可以在这里调用 updateModelCurve 刷新理论曲线
     }
-
-    // 方程更新逻辑 (移除，因为UI中没有对应控件)
-    // 如果您后续添加了 lineEdit_Equation，可以解开注释:
-    /*
-    QString eq = QString("P = %1 log(t) + %2")
-                    .arg(k, 0, 'f', 4)
-                    .arg(b, 0, 'f', 4);
-    if(ui->lineEdit_Equation) ui->lineEdit_Equation->setText(eq);
-    */
 }
 
 void FittingWidget::showEvent(QShowEvent *event)
@@ -298,6 +291,18 @@ void FittingWidget::on_btnLoadData_clicked() {
         }
     }
 
+    // [新增] 将项目级物理参数填充到 Settings 中，以便 Chart 保存和恢复
+    ModelParameter* mp = ModelParameter::instance();
+    if (mp) {
+        settings.porosity = mp->getPhi();
+        settings.thickness = mp->getH();
+        settings.wellRadius = mp->getRw();
+        settings.viscosity = mp->getMu();
+        settings.ct = mp->getCt();
+        settings.fvf = mp->getB();
+        settings.rate = mp->getQ();
+    }
+
     m_chartManager->setSettings(settings);
     setObservedData(rawTime, finalDeltaP, finalDeriv, rawPressureData);
     QMessageBox::information(this, "成功", "观测数据已成功加载。");
@@ -323,7 +328,6 @@ void FittingWidget::on_btnSelectParams_clicked()
         }
         m_paramChart->setParameters(updatedParams);
         hideUnwantedParams();
-
         updateModelCurve(nullptr, false);
     }
 }
@@ -355,7 +359,6 @@ void FittingWidget::onOpenSamplingSettings()
         m_customIntervals = dlg.getIntervals();
         m_isCustomSamplingEnabled = dlg.isCustomSamplingEnabled();
         if(m_core) m_core->setSamplingSettings(m_customIntervals, m_isCustomSamplingEnabled);
-
         updateModelCurve(nullptr, false);
     }
 }
@@ -364,7 +367,7 @@ void FittingWidget::on_btnUpdateLimits_clicked()
 {
     m_paramChart->updateParamsFromTable();
     m_paramChart->autoAdjustLimits();
-    QMessageBox::information(this, "提示", "参数上下限及滚轮步长已根据当前值更新。\n\n范围: 0.1倍 ~ 10倍\n步长: 范围的1/20");
+    QMessageBox::information(this, "提示", "参数上下限及滚轮步长已根据当前值更新。");
 }
 
 void FittingWidget::on_btnRunFit_clicked() {
@@ -373,18 +376,15 @@ void FittingWidget::on_btnRunFit_clicked() {
         QMessageBox::warning(this,"错误","请先加载观测数据。");
         return;
     }
-
     m_paramChart->updateParamsFromTable();
     m_isFitting = true;
     ui->btnRunFit->setEnabled(false);
-
     ui->btnSelectParams->setEnabled(false);
     ui->btnUpdateLimits->setEnabled(false);
 
     ModelManager::ModelType modelType = m_currentModelType;
     QList<FitParameter> paramsCopy = m_paramChart->getParameters();
     double w = ui->sliderWeight->value() / 100.0;
-
     if(m_core) m_core->startFit(modelType, paramsCopy, w);
 }
 
@@ -457,7 +457,6 @@ void FittingWidget::updateModelCurve(const QMap<QString, double>* explicitParams
         QMessageBox::critical(this, "错误", "ModelManager 未初始化！");
         return;
     }
-
     if(m_obsTime.isEmpty()) {
         m_chartLogLog->clearGraphs();
         m_chartSemiLog->clearGraphs();
@@ -476,7 +475,6 @@ void FittingWidget::updateModelCurve(const QMap<QString, double>* explicitParams
     } else {
         QList<FitParameter> allParams = m_paramChart->getParameters();
         for(const auto& p : allParams) rawParams.insert(p.name, p.value);
-
         QMap<QString, QString> rawTexts = m_paramChart->getRawParamTexts();
         for(auto it = rawTexts.begin(); it != rawTexts.end(); ++it) {
             QVector<double> vals = parseSensitivityValues(it.value());
@@ -486,9 +484,7 @@ void FittingWidget::updateModelCurve(const QMap<QString, double>* explicitParams
                     sensitivityKey = it.key();
                     sensitivityValues = vals;
                 }
-            } else {
-                rawParams.insert(it.key(), 0.0);
-            }
+            } else { rawParams.insert(it.key(), 0.0); }
         }
     }
 
@@ -496,7 +492,7 @@ void FittingWidget::updateModelCurve(const QMap<QString, double>* explicitParams
 
     QVector<double> targetT;
     if (m_obsTime.size() > 300) {
-        double tMin = m_obsTime.first() > 1e-5 ? m_obsTime.first() : 1e-5;
+        double tMin = std::max(1e-5, m_obsTime.first());
         double tMax = m_obsTime.last();
         targetT = ModelManager::generateLogTimeSteps(300, log10(tMin), log10(tMax));
     } else if (!m_obsTime.isEmpty()) {
@@ -511,13 +507,11 @@ void FittingWidget::updateModelCurve(const QMap<QString, double>* explicitParams
     if (isSensitivityMode) {
         ui->label_Error->setText(QString("敏感性分析模式: %1 (%2 个值)").arg(sensitivityKey).arg(sensitivityValues.size()));
         m_chartLogLog->clearGraphs();
-
         m_chartManager->plotAll(QVector<double>(), QVector<double>(), QVector<double>(), false, autoScale);
 
         QList<QColor> colors = { Qt::red, Qt::blue, QColor(0,180,0), Qt::magenta, QColor(255,140,0), Qt::cyan, Qt::darkRed, Qt::darkBlue };
         for(int i = 0; i < sensitivityValues.size(); ++i) {
             double val = sensitivityValues[i];
-
             QMap<QString, double> currentParams = rawParams;
             currentParams[sensitivityKey] = val;
             QMap<QString, double> currentSolverParams = FittingCore::preprocessParams(currentParams, m_currentModelType);
@@ -525,35 +519,25 @@ void FittingWidget::updateModelCurve(const QMap<QString, double>* explicitParams
             ModelCurveData res = m_modelManager->calculateTheoreticalCurve(m_currentModelType, currentSolverParams, targetT);
             QColor c = colors[i % colors.size()];
             QString suffix = QString("%1=%2").arg(sensitivityKey).arg(val);
-
             QCPGraph* gP = m_plotLogLog->addGraph();
             gP->setData(std::get<0>(res), std::get<1>(res));
             gP->setPen(QPen(c, 2)); gP->setName("P: "+suffix);
-
             QCPGraph* gD = m_plotLogLog->addGraph();
             gD->setData(std::get<0>(res), std::get<2>(res));
             gD->setPen(QPen(c, 2, Qt::DashLine)); gD->setName("P': "+suffix);
         }
-
     } else {
         ModelCurveData res = m_modelManager->calculateTheoreticalCurve(m_currentModelType, solverParams, targetT);
-
         m_chartManager->plotAll(std::get<0>(res), std::get<1>(res), std::get<2>(res), true, autoScale);
-
         if (!m_obsTime.isEmpty() && m_core && calcError) {
             QVector<double> sampleT, sampleP, sampleD;
             m_core->getLogSampledData(m_obsTime, m_obsDeltaP, m_obsDerivative, sampleT, sampleP, sampleD);
-
             QVector<double> residuals = m_core->calculateResiduals(rawParams, m_currentModelType, ui->sliderWeight->value()/100.0, sampleT, sampleP, sampleD);
             double sse = m_core->calculateSumSquaredError(residuals);
             ui->label_Error->setText(QString("误差(MSE): %1").arg(sse/residuals.size(), 0, 'e', 3));
-
-            if (m_isCustomSamplingEnabled) {
-                m_chartManager->plotSampledPoints(sampleT, sampleP, sampleD);
-            }
+            if (m_isCustomSamplingEnabled) m_chartManager->plotSampledPoints(sampleT, sampleP, sampleD);
         }
     }
-
     m_plotLogLog->replot();
     m_plotSemiLog->replot();
     m_plotCartesian->replot();
@@ -562,25 +546,18 @@ void FittingWidget::updateModelCurve(const QMap<QString, double>* explicitParams
 void FittingWidget::onIterationUpdate(double err, const QMap<QString,double>& p,
                                       const QVector<double>& t, const QVector<double>& p_curve, const QVector<double>& d_curve) {
     ui->label_Error->setText(QString("误差(MSE): %1").arg(err, 0, 'e', 3));
-
     ui->tableParams->blockSignals(true);
     for(int i=0; i<ui->tableParams->rowCount(); ++i) {
         QString key = ui->tableParams->item(i, 1)->data(Qt::UserRole).toString();
-        if(p.contains(key)) {
-            double val = p[key];
-            ui->tableParams->item(i, 2)->setText(QString::number(val, 'g', 5));
-        }
+        if(p.contains(key)) ui->tableParams->item(i, 2)->setText(QString::number(p[key], 'g', 5));
     }
     ui->tableParams->blockSignals(false);
-
     m_chartManager->plotAll(t, p_curve, d_curve, true, false);
-
     if (m_isCustomSamplingEnabled && m_core) {
         QVector<double> sampleT, sampleP, sampleD;
         m_core->getLogSampledData(m_obsTime, m_obsDeltaP, m_obsDerivative, sampleT, sampleP, sampleD);
         m_chartManager->plotSampledPoints(sampleT, sampleP, sampleD);
     }
-
     if(m_plotLogLog) m_plotLogLog->replot();
     if(m_plotSemiLog) m_plotSemiLog->replot();
     if(m_plotCartesian) m_plotCartesian->replot();
@@ -589,27 +566,21 @@ void FittingWidget::onIterationUpdate(double err, const QMap<QString,double>& p,
 void FittingWidget::onFitFinished() {
     m_isFitting = false;
     ui->btnRunFit->setEnabled(true);
-
     ui->btnSelectParams->setEnabled(true);
     ui->btnUpdateLimits->setEnabled(true);
-
     QMessageBox::information(this, "完成", "拟合完成。");
 }
 
 void FittingWidget::on_btnExportData_clicked() {
     m_paramChart->updateParamsFromTable();
     QList<FitParameter> params = m_paramChart->getParameters();
-
     QString defaultDir = ModelParameter::instance()->getProjectPath();
     if(defaultDir.isEmpty()) defaultDir = ".";
-
     QString fileName = QFileDialog::getSaveFileName(this, "导出拟合参数", defaultDir + "/FittingParameters.csv", "CSV Files (*.csv);;Text Files (*.txt)");
     if (fileName.isEmpty()) return;
-
     QFile file(fileName);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) return;
     QTextStream out(&file);
-
     if(fileName.endsWith(".csv", Qt::CaseInsensitive)) {
         file.write("\xEF\xBB\xBF");
         out << QString("参数中文名,参数英文名,拟合值,单位\n");
@@ -634,54 +605,33 @@ void FittingWidget::on_btnExportData_clicked() {
 void FittingWidget::onExportCurveData() {
     QString defaultDir = ModelParameter::instance()->getProjectPath();
     if(defaultDir.isEmpty()) defaultDir = ".";
-
     QString path = QFileDialog::getSaveFileName(this, "导出拟合曲线数据", defaultDir + "/FittingCurves.csv", "CSV Files (*.csv)");
     if (path.isEmpty()) return;
-
     auto graphObsP = m_plotLogLog->graph(0);
     auto graphObsD = m_plotLogLog->graph(1);
-
     if (!graphObsP) return;
-
     QCPGraph *graphModP = (m_plotLogLog->graphCount() > 2) ? m_plotLogLog->graph(2) : nullptr;
     QCPGraph *graphModD = (m_plotLogLog->graphCount() > 3) ? m_plotLogLog->graph(3) : nullptr;
-
     QFile f(path);
     if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
         QTextStream out(&f);
         out << "Obs_Time,Obs_DP,Obs_Deriv,Model_Time,Model_DP,Model_Deriv\n";
-
         auto itObsP = graphObsP->data()->begin();
         auto itObsD = graphObsD->data()->begin();
         auto endObsP = graphObsP->data()->end();
-
         QCPGraphDataContainer::const_iterator itModP, endModP, itModD;
         bool hasModel = (graphModP != nullptr && graphModD != nullptr);
-        if(hasModel) {
-            itModP = graphModP->data()->begin();
-            endModP = graphModP->data()->end();
-            itModD = graphModD->data()->begin();
-        }
-
+        if(hasModel) { itModP = graphModP->data()->begin(); endModP = graphModP->data()->end(); itModD = graphModD->data()->begin(); }
         while (itObsP != endObsP || (hasModel && itModP != endModP)) {
             QStringList line;
             if (itObsP != endObsP) {
-                line << QString::number(itObsP->key, 'g', 10);
-                line << QString::number(itObsP->value, 'g', 10);
-                if (itObsD != graphObsD->data()->end()) {
-                    line << QString::number(itObsD->value, 'g', 10);
-                    ++itObsD;
-                } else { line << ""; }
+                line << QString::number(itObsP->key, 'g', 10) << QString::number(itObsP->value, 'g', 10);
+                if (itObsD != graphObsD->data()->end()) { line << QString::number(itObsD->value, 'g', 10); ++itObsD; } else { line << ""; }
                 ++itObsP;
             } else { line << "" << "" << ""; }
-
             if (hasModel && itModP != endModP) {
-                line << QString::number(itModP->key, 'g', 10);
-                line << QString::number(itModP->value, 'g', 10);
-                if (itModD != graphModD->data()->end()) {
-                    line << QString::number(itModD->value, 'g', 10);
-                    ++itModD;
-                } else { line << ""; }
+                line << QString::number(itModP->key, 'g', 10) << QString::number(itModP->value, 'g', 10);
+                if (itModD != graphModD->data()->end()) { line << QString::number(itModD->value, 'g', 10); ++itModD; } else { line << ""; }
                 ++itModP;
             } else { line << "" << "" << ""; }
             out << line.join(",") << "\n";
@@ -691,8 +641,7 @@ void FittingWidget::onExportCurveData() {
     }
 }
 
-void FittingWidget::on_btnExportReport_clicked()
-{
+void FittingWidget::on_btnExportReport_clicked() {
     QString wellName = "未命名井";
     QString projectFilePath = ModelParameter::instance()->getProjectFilePath();
     QFile pwtFile(projectFilePath);
@@ -709,25 +658,16 @@ void FittingWidget::on_btnExportReport_clicked()
         }
         pwtFile.close();
     }
-    if (wellName == "未命名井" || wellName.isEmpty()) {
-        QFileInfo fi(projectFilePath);
-        wellName = fi.completeBaseName();
-    }
+    if (wellName == "未命名井" || wellName.isEmpty()) { QFileInfo fi(projectFilePath); wellName = fi.completeBaseName(); }
 
     FittingReportData reportData;
     reportData.wellName = wellName;
     reportData.modelType = m_currentModelType;
-
     QString mseText = ui->label_Error->text().remove("误差(MSE): ");
     reportData.mse = mseText.toDouble();
-
-    reportData.t = m_obsTime;
-    reportData.p = m_obsDeltaP;
-    reportData.d = m_obsDerivative;
-
+    reportData.t = m_obsTime; reportData.p = m_obsDeltaP; reportData.d = m_obsDerivative;
     m_paramChart->updateParamsFromTable();
     reportData.params = m_paramChart->getParameters();
-
     reportData.imgLogLog = getPlotImageBase64(m_plotLogLog);
     reportData.imgSemiLog = getPlotImageBase64(m_plotSemiLog);
     reportData.imgCartesian = getPlotImageBase64(m_plotCartesian);
@@ -780,6 +720,38 @@ QJsonObject FittingWidget::getJsonState() const
     plotRange["yMax"] = m_plotLogLog->yAxis->range().upper;
     root["plotView"] = plotRange;
 
+    // 保存半对数图视野
+    QJsonObject semiLogRange;
+    semiLogRange["xMin"] = m_plotSemiLog->xAxis->range().lower;
+    semiLogRange["xMax"] = m_plotSemiLog->xAxis->range().upper;
+    semiLogRange["yMin"] = m_plotSemiLog->yAxis->range().lower;
+    semiLogRange["yMax"] = m_plotSemiLog->yAxis->range().upper;
+    root["plotViewSemiLog"] = semiLogRange;
+
+    // 保存数据配置
+    if (m_chartManager) {
+        FittingDataSettings settings = m_chartManager->getSettings();
+        QJsonObject settingsObj;
+        settingsObj["producingTime"] = settings.producingTime;
+        settingsObj["initialPressure"] = settings.initialPressure;
+        settingsObj["testType"] = (int)settings.testType;
+        settingsObj["porosity"] = settings.porosity;
+        settingsObj["thickness"] = settings.thickness;
+        settingsObj["wellRadius"] = settings.wellRadius;
+        settingsObj["viscosity"] = settings.viscosity;
+        settingsObj["ct"] = settings.ct;
+        settingsObj["fvf"] = settings.fvf;
+        settingsObj["rate"] = settings.rate;
+        settingsObj["skipRows"] = settings.skipRows;
+        settingsObj["timeCol"] = settings.timeColIndex;
+        settingsObj["presCol"] = settings.pressureColIndex;
+        settingsObj["derivCol"] = settings.derivColIndex;
+        settingsObj["lSpacing"] = settings.lSpacing;
+        settingsObj["smoothing"] = settings.enableSmoothing;
+        settingsObj["span"] = settings.smoothingSpan;
+        root["dataSettings"] = settingsObj;
+    }
+
     QJsonArray paramsArray;
     for(const auto& p : params) {
         QJsonObject pObj;
@@ -818,6 +790,11 @@ QJsonObject FittingWidget::getJsonState() const
     }
     root["customIntervals"] = intervalArr;
 
+    // 保存手动拟合结果
+    if (m_chartManager) {
+        root["manualPressureFitState"] = m_chartManager->getManualPressureState();
+    }
+
     return root;
 }
 
@@ -832,6 +809,32 @@ void FittingWidget::loadFittingState(const QJsonObject& root)
     }
 
     m_paramChart->resetParams(m_currentModelType);
+
+    // 优先加载数据配置
+    if (root.contains("dataSettings") && m_chartManager) {
+        QJsonObject sObj = root["dataSettings"].toObject();
+        FittingDataSettings settings;
+        settings.producingTime = sObj["producingTime"].toDouble();
+        settings.initialPressure = sObj["initialPressure"].toDouble();
+        // 修正为 WellTestType
+        settings.testType = (WellTestType)sObj["testType"].toInt();
+        settings.porosity = sObj["porosity"].toDouble();
+        settings.thickness = sObj["thickness"].toDouble();
+        settings.wellRadius = sObj["wellRadius"].toDouble();
+        settings.viscosity = sObj["viscosity"].toDouble();
+        settings.ct = sObj["ct"].toDouble();
+        settings.fvf = sObj["fvf"].toDouble();
+        settings.rate = sObj["rate"].toDouble();
+        settings.skipRows = sObj["skipRows"].toInt();
+        settings.timeColIndex = sObj["timeCol"].toInt();
+        settings.pressureColIndex = sObj["presCol"].toInt();
+        settings.derivColIndex = sObj["derivCol"].toInt();
+        settings.lSpacing = sObj["lSpacing"].toDouble();
+        settings.enableSmoothing = sObj["smoothing"].toBool();
+        settings.smoothingSpan = sObj["span"].toDouble();
+
+        m_chartManager->setSettings(settings);
+    }
 
     QMap<QString, double> explicitParamsMap;
     if (root.contains("parameters")) {
@@ -908,6 +911,25 @@ void FittingWidget::loadFittingState(const QJsonObject& root)
                 m_plotLogLog->replot();
             }
         }
+    }
+
+    if (root.contains("plotViewSemiLog")) {
+        QJsonObject range = root["plotViewSemiLog"].toObject();
+        if (range.contains("xMin") && range.contains("xMax")) {
+            double xMin = range["xMin"].toDouble();
+            double xMax = range["xMax"].toDouble();
+            double yMin = range["yMin"].toDouble();
+            double yMax = range["yMax"].toDouble();
+            if (xMax > xMin || (xMax < xMin)) {
+                m_plotSemiLog->xAxis->setRange(xMin, xMax);
+                m_plotSemiLog->yAxis->setRange(yMin, yMax);
+                m_plotSemiLog->replot();
+            }
+        }
+    }
+
+    if (root.contains("manualPressureFitState") && m_chartManager) {
+        m_chartManager->setManualPressureState(root["manualPressureFitState"].toObject());
     }
 }
 
